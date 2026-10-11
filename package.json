@@ -1,13 +1,17 @@
 {
   "name": "xhamster-proxy",
   "version": "1.0.0",
+  "private": true,
+  "description": "Express-based xHamster search proxy",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "express": "^4.21.0",
-    "node-fetch": "^2.7.0",
-    "cheerio": "^1.0.0"
+    "cheerio": "^1.0.0",
+    "express": "^4.21.2"
   }
 }
