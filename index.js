@@ -1,93 +1,273 @@
 const express = require("express");
-const app = express();
 const cheerio = require("cheerio");
 
-app.get("/api/xhamster-search", async (req, res) => {
-  const query = req.query.q || req.query.search;
-  const page = req.query.page || "1";
+const app = express();
+app.disable("x-powered-by");
+app.disable("etag");
+app.use(express.json({ limit: "32kb" }));
 
-  if (!query) {
-    return res.status(400).json({ error: "Missing q parameter" });
+const PORT = Number(process.env.PORT) || 3000;
+const UPSTREAM_ORIGIN = "https://xhamster.com";
+const REQUEST_TIMEOUT_MS = Math.min(
+  Math.max(Number(process.env.REQUEST_TIMEOUT_MS) || 12000, 3000),
+  25000
+);
+
+const USER_AGENT =
+  process.env.UPSTREAM_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+function noStore(res) {
+  res.set({
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    Pragma: "no-cache",
+    Expires: "0",
+  });
+}
+
+function cleanText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function safeUrl(value, base = UPSTREAM_ORIGIN) {
+  try {
+    const url = new URL(value, base);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function classifyPage(html, contentType, finalUrl) {
+  const host = safeUrl(finalUrl)?.hostname.toLowerCase() || "";
+  const sample = html.slice(0, 250000).toLowerCase();
+
+  if (!host.endsWith("xhamster.com")) return "redirected-away";
+  if (!contentType.toLowerCase().includes("text/html")) return "not-html";
+  if (/captcha|verify you are human|are you a robot|cf-chl-|challenge-platform/.test(sample)) {
+    return "challenge";
+  }
+  if (/access denied|temporarily blocked|unusual traffic|request blocked|forbidden/.test(sample)) {
+    return "blocked";
+  }
+  return "html";
+}
+
+function extractVideos($) {
+  const videos = [];
+  const seen = new Set();
+
+  const selectors = [
+    "div.thumb-list__item",
+    "div.video-thumb",
+    "[data-video-id]",
+    "article",
+  ];
+
+  const cards = $(selectors.join(",")).toArray();
+
+  for (const element of cards) {
+    const card = $(element);
+    const anchors = card.find("a[href]").toArray();
+    let videoUrl = null;
+
+    for (const a of anchors) {
+      const parsed = safeUrl($(a).attr("href"));
+      if (
+        parsed &&
+        parsed.hostname.toLowerCase().endsWith("xhamster.com") &&
+        /\/videos?\//i.test(parsed.pathname)
+      ) {
+        videoUrl = parsed;
+        break;
+      }
+    }
+
+    if (!videoUrl || seen.has(videoUrl.href)) continue;
+
+    const title =
+      cleanText(card.find("a[title]").first().attr("title")) ||
+      cleanText(card.find("[title]").first().attr("title")) ||
+      cleanText(card.find(".video-thumb-info__name, .thumb-list__item-title, h3, h2").first().text()) ||
+      cleanText(card.find("img").first().attr("alt"));
+
+    if (!title) continue;
+
+    const img = card.find("img").first();
+    const rawThumb =
+      img.attr("data-src") ||
+      img.attr("data-original") ||
+      img.attr("data-lazy-src") ||
+      img.attr("src") ||
+      null;
+    const thumbUrl = rawThumb ? safeUrl(rawThumb) : null;
+
+    const duration = cleanText(
+      card.find(
+        ".thumb-image-container__duration, .duration, [class*='duration']"
+      ).first().text()
+    );
+
+    const pathParts = videoUrl.pathname.split("/").filter(Boolean);
+    const id = pathParts.length ? pathParts[pathParts.length - 1] : null;
+
+    seen.add(videoUrl.href);
+    videos.push({
+      title,
+      url: videoUrl.href,
+      thumb: thumbUrl ? thumbUrl.href : null,
+      duration: duration || null,
+      video_id: id,
+    });
   }
 
+  return videos;
+}
+
+app.get("/", (_req, res) => {
+  noStore(res);
+  res.status(200).json({
+    status: "online",
+    service: "xHamster Search Proxy",
+    endpoints: [
+      "/health",
+      "/xhamster?q=indian&page=1",
+      "/debug/xhamster?q=indian&page=1",
+    ],
+  });
+});
+
+app.get("/health", (_req, res) => {
+  noStore(res);
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+async function searchHandler(req, res, debug = false) {
+  noStore(res);
+
+  const query = cleanText(req.query.q || req.query.search).slice(0, 160);
+  const rawPage = String(req.query.page || "1");
+
+  if (!query) {
+    return res.status(400).json({
+      error: "Missing q parameter. Example: /xhamster?q=indian",
+    });
+  }
+  if (!/^\d+$/.test(rawPage) || Number(rawPage) < 1) {
+    return res.status(400).json({ error: "page must be a positive integer" });
+  }
+
+  const page = Math.min(Number(rawPage), 100);
+  const searchUrl = new URL(`/search/${encodeURIComponent(query)}`, UPSTREAM_ORIGIN);
+  searchUrl.searchParams.set("page", String(page));
+  const startedAt = Date.now();
+
   try {
-    const searchUrl = `https://xhamster.com/search/${encodeURIComponent(query)}?page=${page}`;
-
     const response = await fetch(searchUrl, {
+      method: "GET",
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://xhamster.com/",
-        "Origin": "https://xhamster.com",
-        "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-        // Age / consent related cookies (Pornhub style)
-        "Cookie": "cookie_accept=1; age_confirmed=1; platform_type=desktop; lang=en;"
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
       },
-      redirect: "follow"
+      redirect: "follow",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
+    const contentType = response.headers.get("content-type") || "";
+    const finalUrl = response.url || searchUrl.href;
     const html = await response.text();
-    const $ = cheerio.load(html);
+    const pageKind = classifyPage(html, contentType, finalUrl);
 
-    // Debug logs (Railway pe dikhenge)
-    console.log("xhamster_search", {
+    const baseDiagnostics = {
       upstreamStatus: response.status,
-      finalUrl: response.url,
-      htmlLength: html.length,
-      pageTitle: $("title").text().trim(),
-      containsThumb: html.includes("thumb"),
-      pageKind: html.includes("challenge") || html.includes("Just a moment") ? "challenge" : "normal"
-    });
+      upstreamOk: response.ok,
+      finalUrl: safeUrl(finalUrl)?.origin + (safeUrl(finalUrl)?.pathname || ""),
+      contentType,
+      pageKind,
+      responseBytes: Buffer.byteLength(html),
+      durationMs: Date.now() - startedAt,
+    };
 
-    const videos = [];
+    if (!response.ok || pageKind !== "html") {
+      console.warn("upstream_unavailable", JSON.stringify(baseDiagnostics));
+      return res.status(502).json({
+        source: "xhamster",
+        error: !response.ok
+          ? `Upstream returned HTTP ${response.status}`
+          : `Upstream returned an unsupported page (${pageKind})`,
+        ...(debug ? { diagnostics: baseDiagnostics } : {}),
+      });
+    }
 
-    // Updated selectors (thoda zyada coverage)
-    $("div.thumb-list__item, div.video-thumb, div.thumb-list__item--video, a.video-thumb__image-container").each((i, el) => {
-      const $el = $(el);
-      const title = $el.find("a").attr("title") || 
-                    $el.find(".video-thumb-info__name, .thumb-image-container__name").text().trim() ||
-                    $el.attr("title");
-      
-      const link = $el.find("a").attr("href") || $el.attr("href");
-      const thumb = $el.find("img").attr("src") || $el.find("img").attr("data-src") || $el.find("img").attr("data-original");
-      const duration = $el.find(".thumb-image-container__duration, .duration, .video-thumb__duration").text().trim();
+    const $ = cheerio.load(html);
+    const videos = extractVideos($);
+    const pageTitle = cleanText($("title").first().text()).slice(0, 180);
 
-      if (link && title) {
-        const fullUrl = link.startsWith("http") ? link : `https://xhamster.com${link}`;
-        const slugMatch = fullUrl.match(/\/videos\/([^\/\?]+)/);
-        const id = slugMatch ? slugMatch[1] : null;
+    const diagnostics = {
+      ...baseDiagnostics,
+      pageTitle,
+      parsedVideoCount: videos.length,
+      matchingAnchors: $("a[href*='/video'], a[href*='/videos/']").length,
+    };
 
-        videos.push({
-          title: title.trim(),
-          url: fullUrl,
-          thumb: thumb || null,
-          duration: duration || null,
-          video_id: id,
-          embed: id ? `https://xhamster.com/embed/${id}` : null
-        });
-      }
-    });
+    console.info("search_complete", JSON.stringify({
+      queryLength: query.length,
+      page,
+      ...diagnostics,
+    }));
 
-    res.json({
+    return res.status(200).json({
       source: "xhamster",
       query,
       page,
       count: videos.length,
-      videos
+      videos,
+      ...(debug ? { diagnostics } : {}),
+      ...(videos.length === 0
+        ? { note: "No video cards matched the current HTML selectors; upstream markup may have changed." }
+        : {}),
     });
+  } catch (error) {
+    const timedOut =
+      error?.name === "TimeoutError" ||
+      error?.name === "AbortError";
 
-  } catch (err) {
-    console.error("xhamster error:", err.message);
-    res.status(500).json({ error: err.message });
+    const diagnostics = {
+      failureType: timedOut ? "timeout" : "fetch-error",
+      message: cleanText(error?.message || error).slice(0, 250),
+      durationMs: Date.now() - startedAt,
+    };
+
+    console.error("search_failed", JSON.stringify(diagnostics));
+
+    return res.status(502).json({
+      source: "xhamster",
+      error: timedOut
+        ? "Upstream request timed out"
+        : "Could not retrieve upstream search results",
+      ...(debug ? { diagnostics } : {}),
+    });
   }
+}
+
+app.get("/xhamster", (req, res) =>
+  searchHandler(req, res, req.query.debug === "1")
+);
+app.get("/api/xhamster-search", (req, res) =>
+  searchHandler(req, res, req.query.debug === "1")
+);
+app.get("/debug/xhamster", (req, res) => searchHandler(req, res, true));
+
+app.use((_req, res) => {
+  noStore(res);
+  res.status(404).json({ error: "Endpoint not found" });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server listening on 0.0.0.0:${PORT}`);
 });
