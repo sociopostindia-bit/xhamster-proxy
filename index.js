@@ -1,3 +1,5 @@
+const express = require("express");
+const app = express();
 const cheerio = require("cheerio");
 
 app.get("/api/xhamster-search", async (req, res) => {
